@@ -50,6 +50,7 @@ namespace InteractiveLockpickingVR {
 	extern int lockpickBreakRespawnDelayMs;
 	extern int lockpickSessionStartDelayMs;
 	extern int keyDoorGrabDelayMs;
+	extern float keyDoorTurnDegrees;
 	extern int lockpickBreakDuringHold;
 	extern int lockpickBreakRollIntervalMs;
 	extern float lockpickBreakSoundVolume;
@@ -94,6 +95,19 @@ namespace InteractiveLockpickingVR {
 	extern std::vector<ExcludedInteriorDoorBase> excludedInteriorDoorBases;
 
 	bool IsExcludedInteriorDoorBase(TESObjectREFR* ref);
+
+	// Base DOOR forms for load doors (teleport / cave entrances) that must keep
+	// vanilla activate. Matches ref->baseForm->formID — covers every placed
+	// instance of that door type. Use this for caves, NOT ExcludeDoorRefs.
+	struct ExcludedLoadDoorBase
+	{
+		std::string pluginName;
+		UInt32 localFormId = 0;
+		mutable UInt32 resolvedFormId = 0;
+	};
+	extern std::vector<ExcludedLoadDoorBase> excludedLoadDoorBases;
+
+	bool IsExcludedLoadDoorBase(TESObjectREFR* ref);
 
 	// Base DOOR forms (and optional refs) that skip witnessed lockpick crime/bounty.
 	struct ExcludeLockpickCrimeDoorBase

@@ -164,6 +164,21 @@ namespace InteractiveLockpickingVR
 			return actor->formType == kFormType_Character;
 		}
 
+		// Companions, party followers, and commanded allies (vanilla GetPlayerTeammate).
+		bool IsPlayerFollowerOrTeammate(Actor* actor)
+		{
+			if (!actor)
+				return false;
+
+			if (actor->flags1 & Actor::kFlags_IsPlayerTeammate)
+				return true;
+
+			if (actor->flags2 & Actor::kFlag_kIsCommandedActor)
+				return true;
+
+			return false;
+		}
+
 		// Strict validation: the Helgen intro (and alternate starts) can keep
 		// actors loaded in detached cells (e.g. an Embers XD "Wilderness" wolf).
 		// Passing those to engine detection code corrupts the scrap heap and CTDs,
@@ -174,6 +189,9 @@ namespace InteractiveLockpickingVR
 				return false;
 
 			if (actor == reinterpret_cast<Actor*>(player))
+				return false;
+
+			if (IsPlayerFollowerOrTeammate(actor))
 				return false;
 
 			if (actor->formType != kFormType_Character)

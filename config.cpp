@@ -30,6 +30,7 @@ namespace InteractiveLockpickingVR {
     int lockpickBreakRespawnDelayMs = 2000;
     int lockpickSessionStartDelayMs = 2000;
     int keyDoorGrabDelayMs = 1500;
+    float keyDoorTurnDegrees = 20.0f;
     int lockpickBreakDuringHold = 0;
     int lockpickBreakRollIntervalMs = 1500;
     float lockpickBreakSoundVolume = 2.0f;
@@ -42,8 +43,25 @@ namespace InteractiveLockpickingVR {
 	// Helgen Keep entrance/exit (Skyrim.esm) - hinge origin is far from the
 	// visible gate; excluded so vanilla activation works normally.
 	std::vector<ExcludedDoorRef> excludedDoorRefs = {
-		{ "skyrim.esm", 0x0005DF01, 0 },
-		{ "skyrim.esm", 0x000F8237, 0 },
+		{ "skyrim.esm", 0x0005DF01, 0 },  // Helgen Keep entrance
+		{ "skyrim.esm", 0x000F8237, 0 },  // Helgen Keep exit
+		{ "skyrim.esm", 0x0001C386, 0 },  // Solitude main gate entrance
+		{ "skyrim.esm", 0x00037F1B, 0 },  // Solitude main gate exit
+		{ "skyrim.esm", 0x00037603, 0 },  // Bleak Falls Barrow exit
+		{ "skyrim.esm", 0x0002B83B, 0 },  // Bleak Falls Barrow entrance
+		{ "skyrim.esm", 0x00025C00, 0 },
+		{ "skyrim.esm", 0x000CD66F, 0 },  // Labyrinth double door
+	};
+
+	// Load-door base forms that keep vanilla activate (cave mouths, etc.).
+	std::vector<ExcludedLoadDoorBase> excludedLoadDoorBases = {
+		{ "skyrim.esm", 0x00016383, 0 },
+		{ "skyrim.esm", 0x00016384, 0 },
+		{ "skyrim.esm", 0x00031897, 0 },  // AutoLoadDoor01
+		{ "skyrim.esm", 0x0002ED73, 0 },
+		{ "skyrim.esm", 0x0002ED74, 0 },
+		{ "skyrim.esm", 0x0002ED75, 0 },
+		{ "skyrim.esm", 0x0002ED76, 0 },
 	};
 
 	// Interactive Doors mods - interior bases that stay vanilla.
@@ -138,6 +156,23 @@ namespace InteractiveLockpickingVR {
 			AppendPluginFormEntry(token, "ExcludeInteriorDoorBases", entry.pluginName, entry.localFormId);
 			if (entry.localFormId != 0)
 				excludedInteriorDoorBases.push_back(entry);
+		}
+	}
+
+	static void AppendExcludedLoadDoorBase(const std::string& value)
+	{
+		std::stringstream stream(value);
+		std::string token;
+		while (std::getline(stream, token, ','))
+		{
+			trim(token);
+			if (token.empty())
+				continue;
+
+			ExcludedLoadDoorBase entry;
+			AppendPluginFormEntry(token, "ExcludeLoadDoorBases", entry.pluginName, entry.localFormId);
+			if (entry.localFormId != 0)
+				excludedLoadDoorBases.push_back(entry);
 		}
 	}
 
@@ -255,6 +290,29 @@ namespace InteractiveLockpickingVR {
 		return false;
 	}
 
+	bool IsExcludedLoadDoorBase(TESObjectREFR* ref)
+	{
+		if (!ref || !ref->baseForm || excludedLoadDoorBases.empty())
+			return false;
+
+		const UInt32 baseFormId = ref->baseForm->formID;
+
+		for (ExcludedLoadDoorBase& entry : excludedLoadDoorBases)
+		{
+			if (entry.resolvedFormId == 0)
+				entry.resolvedFormId = GetFullFormIdFromEspAndFormId(entry.pluginName.c_str(), entry.localFormId);
+
+			if (entry.resolvedFormId != 0 && baseFormId == entry.resolvedFormId)
+				return true;
+
+			// Skyrim.esm master records: also match bare local ID.
+			if (entry.localFormId != 0 && (baseFormId & 0x00FFFFFF) == entry.localFormId)
+				return true;
+		}
+
+		return false;
+	}
+
 	bool IsPullLoadDoorRef(TESObjectREFR* ref)
 	{
 		if (!ref || pullLoadDoorRefs.empty())
@@ -330,6 +388,7 @@ namespace InteractiveLockpickingVR {
                 std::string currentSection;
                 bool excludeDoorRefsFromIni = false;
                 bool excludeInteriorDoorBasesFromIni = false;
+                bool excludeLoadDoorBasesFromIni = false;
                 bool pullLoadDoorRefsFromIni = false;
                 bool excludeLockpickCrimeDoorBasesFromIni = false;
                 bool extendedSessionStartDoorBasesFromIni = false;
@@ -485,6 +544,14 @@ namespace InteractiveLockpickingVR {
                             if (keyDoorGrabDelayMs < 0)
                                 keyDoorGrabDelayMs = 0;
                         }
+                        else if (variableName == "KeyDoorTurnDegrees")
+                        {
+                            keyDoorTurnDegrees = std::stof(variableValueStr);
+                            if (keyDoorTurnDegrees < 5.0f)
+                                keyDoorTurnDegrees = 5.0f;
+                            if (keyDoorTurnDegrees > 180.0f)
+                                keyDoorTurnDegrees = 180.0f;
+                        }
                         else if (variableName == "LockpickBreakDuringHold")
                         {
                             lockpickBreakDuringHold = std::stoi(variableValueStr);
@@ -540,6 +607,15 @@ namespace InteractiveLockpickingVR {
                                 excludeInteriorDoorBasesFromIni = true;
                             }
                             AppendExcludedInteriorDoorBase(variableValueStr);
+                        }
+                        else if (variableName == "ExcludeLoadDoorBases")
+                        {
+                            if (!excludeLoadDoorBasesFromIni)
+                            {
+                                excludedLoadDoorBases.clear();
+                                excludeLoadDoorBasesFromIni = true;
+                            }
+                            AppendExcludedLoadDoorBase(variableValueStr);
                         }
                         else if (variableName == "PullLoadDoorRefs")
                         {
