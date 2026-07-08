@@ -44,6 +44,8 @@ namespace InteractiveLockpickingVR {
 	extern float doorSessionStartDistance;
 	extern float extendedSessionStartDistance;
 	extern float extendedSessionEndDistance;
+	extern float shortSessionStartDistance;
+	extern float shortSessionEndDistance;
 	extern float doorSessionEndDistance;
 	extern float lockpickTouchDistance;
 	extern float lockpickShivMaxDistance;
@@ -53,6 +55,7 @@ namespace InteractiveLockpickingVR {
 	extern float keyDoorTurnDegrees;
 	extern int lockpickBreakDuringHold;
 	extern int lockpickBreakRollIntervalMs;
+	extern int lockpickBreakMinGapMs;
 	extern float lockpickBreakSoundVolume;
 	extern float unlockedDoorPushDistance;
 	extern float unlockedDoorTouchDistance;
@@ -71,18 +74,6 @@ namespace InteractiveLockpickingVR {
 	extern std::vector<ExcludedDoorRef> excludedDoorRefs;
 
 	bool IsExcludedDoorRef(TESObjectREFR* ref);
-
-	// Placed load-door refs (ExtraTeleport) that use back-face pull-to-open.
-	// All other load doors always use push, regardless of which side you stand on.
-	struct PullLoadDoorRef
-	{
-		std::string pluginName;
-		UInt32 localFormId = 0;
-		mutable UInt32 resolvedFormId = 0;
-	};
-	extern std::vector<PullLoadDoorRef> pullLoadDoorRefs;
-
-	bool IsPullLoadDoorRef(TESObjectREFR* ref);
 
 	// Base DOOR forms (not refs) excluded from interior non-load push/dummy
 	// logic. All other interior non-load doors use physical interaction.
@@ -129,6 +120,27 @@ namespace InteractiveLockpickingVR {
 		mutable UInt32 resolvedFormId = 0;
 	};
 	extern std::vector<ExtendedSessionStartDoorBase> extendedSessionStartDoorBases;
+
+	// Placed door refs with a shorter push/pull session range than the global
+	// DoorSessionStartDistance / DoorSessionEndDistance.
+	struct ShortSessionDoorRef
+	{
+		std::string pluginName;
+		UInt32 localFormId = 0;
+		mutable UInt32 resolvedFormId = 0;
+	};
+	extern std::vector<ShortSessionDoorRef> shortSessionDoorRefs;
+
+	bool IsShortSessionDoorRef(TESObjectREFR* ref);
+
+	// Base DOOR forms that use ShortSessionStartDistance / ShortSessionEndDistance.
+	struct ShortSessionStartDoorBase
+	{
+		std::string pluginName;
+		UInt32 localFormId = 0;
+		mutable UInt32 resolvedFormId = 0;
+	};
+	extern std::vector<ShortSessionStartDoorBase> shortSessionStartDoorBases;
 
 	float GetDoorSessionStartDistance(TESObjectREFR* ref);
 	float GetDoorSessionEndDistance(TESObjectREFR* ref);

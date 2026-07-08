@@ -24,6 +24,8 @@ namespace InteractiveLockpickingVR {
     float doorSessionStartDistance = 120.0f;
     float extendedSessionStartDistance = 165.0f;
     float extendedSessionEndDistance = 170.0f;
+    float shortSessionStartDistance = 70.0f;
+    float shortSessionEndDistance = 80.0f;
     float doorSessionEndDistance = 150.0f;
     float lockpickTouchDistance = 3.0f;
     float lockpickShivMaxDistance = 28.0f;
@@ -33,6 +35,7 @@ namespace InteractiveLockpickingVR {
     float keyDoorTurnDegrees = 20.0f;
     int lockpickBreakDuringHold = 0;
     int lockpickBreakRollIntervalMs = 1500;
+    int lockpickBreakMinGapMs = 2000;
     float lockpickBreakSoundVolume = 2.0f;
     float unlockedDoorPushDistance = 4.0f;
     float unlockedDoorTouchDistance = 8.0f;
@@ -77,8 +80,9 @@ namespace InteractiveLockpickingVR {
 		{ "skyrim.esm", 0x00060D85, 0 },
 	};
 
-	// Load doors (teleport) that use back-face pull; all others always push.
-	std::vector<PullLoadDoorRef> pullLoadDoorRefs = {};
+	std::vector<ShortSessionDoorRef> shortSessionDoorRefs = {};
+
+	std::vector<ShortSessionStartDoorBase> shortSessionStartDoorBases = {};
 
 	// Cage doors and similar — no witnessed lockpick crime/bounty (Helgen intro CTD).
 	std::vector<ExcludeLockpickCrimeDoorBase> excludeLockpickCrimeDoorBases = {
@@ -189,7 +193,7 @@ namespace InteractiveLockpickingVR {
 			extendedSessionStartDoorBases.push_back(entry);
 	}
 
-	static void AppendPullLoadDoorRef(const std::string& value)
+	static void AppendShortSessionDoorRef(const std::string& value)
 	{
 		std::stringstream stream(value);
 		std::string token;
@@ -199,11 +203,24 @@ namespace InteractiveLockpickingVR {
 			if (token.empty())
 				continue;
 
-			PullLoadDoorRef entry;
-			AppendPluginFormEntry(token, "PullLoadDoorRefs", entry.pluginName, entry.localFormId);
+			ShortSessionDoorRef entry;
+			AppendPluginFormEntry(token, "ShortSessionDoorRefs", entry.pluginName, entry.localFormId);
 			if (entry.localFormId != 0)
-				pullLoadDoorRefs.push_back(entry);
+				shortSessionDoorRefs.push_back(entry);
 		}
+	}
+
+	static void AppendShortSessionStartDoorBase(const std::string& value)
+	{
+		std::string entryLine = value;
+		trim(entryLine);
+		if (entryLine.empty())
+			return;
+
+		ShortSessionStartDoorBase entry;
+		AppendPluginFormEntry(entryLine, "ShortSessionStartDoorBases", entry.pluginName, entry.localFormId);
+		if (entry.localFormId != 0)
+			shortSessionStartDoorBases.push_back(entry);
 	}
 
 	static void AppendExcludeLockpickCrimeDoorBase(const std::string& value)
@@ -240,10 +257,60 @@ namespace InteractiveLockpickingVR {
 		return false;
 	}
 
+	bool IsShortSessionDoorRef(TESObjectREFR* ref)
+	{
+		if (!ref || shortSessionDoorRefs.empty())
+			return false;
+
+		for (ShortSessionDoorRef& entry : shortSessionDoorRefs)
+		{
+			if (entry.resolvedFormId == 0)
+				entry.resolvedFormId = GetFullFormIdFromEspAndFormId(entry.pluginName.c_str(), entry.localFormId);
+
+			if (entry.resolvedFormId != 0 && ref->formID == entry.resolvedFormId)
+				return true;
+
+			if (entry.localFormId != 0 && (ref->formID & 0x00FFFFFF) == entry.localFormId)
+				return true;
+		}
+
+		return false;
+	}
+
+	bool UsesShortSessionStartDoorBase(TESObjectREFR* ref)
+	{
+		if (!ref || !ref->baseForm || shortSessionStartDoorBases.empty())
+			return false;
+
+		const UInt32 baseFormId = ref->baseForm->formID;
+
+		for (ShortSessionStartDoorBase& entry : shortSessionStartDoorBases)
+		{
+			if (entry.resolvedFormId == 0)
+				entry.resolvedFormId = GetFullFormIdFromEspAndFormId(entry.pluginName.c_str(), entry.localFormId);
+
+			if (entry.resolvedFormId != 0 && baseFormId == entry.resolvedFormId)
+				return true;
+
+			if (entry.localFormId != 0 && (baseFormId & 0x00FFFFFF) == entry.localFormId)
+				return true;
+		}
+
+		return false;
+	}
+
+	bool UsesShortSessionDistance(TESObjectREFR* ref)
+	{
+		return IsShortSessionDoorRef(ref) || UsesShortSessionStartDoorBase(ref);
+	}
+
 	float GetDoorSessionStartDistance(TESObjectREFR* ref)
 	{
 		if (UsesExtendedSessionStartDistance(ref))
 			return extendedSessionStartDistance;
+
+		if (UsesShortSessionDistance(ref))
+			return shortSessionStartDistance;
 
 		return doorSessionStartDistance;
 	}
@@ -252,6 +319,9 @@ namespace InteractiveLockpickingVR {
 	{
 		if (UsesExtendedSessionStartDistance(ref))
 			return extendedSessionEndDistance;
+
+		if (UsesShortSessionDistance(ref))
+			return shortSessionEndDistance;
 
 		return doorSessionEndDistance;
 	}
@@ -307,23 +377,6 @@ namespace InteractiveLockpickingVR {
 
 			// Skyrim.esm master records: also match bare local ID.
 			if (entry.localFormId != 0 && (baseFormId & 0x00FFFFFF) == entry.localFormId)
-				return true;
-		}
-
-		return false;
-	}
-
-	bool IsPullLoadDoorRef(TESObjectREFR* ref)
-	{
-		if (!ref || pullLoadDoorRefs.empty())
-			return false;
-
-		for (PullLoadDoorRef& entry : pullLoadDoorRefs)
-		{
-			if (entry.resolvedFormId == 0)
-				entry.resolvedFormId = GetFullFormIdFromEspAndFormId(entry.pluginName.c_str(), entry.localFormId);
-
-			if (entry.resolvedFormId != 0 && ref->formID == entry.resolvedFormId)
 				return true;
 		}
 
@@ -389,9 +442,10 @@ namespace InteractiveLockpickingVR {
                 bool excludeDoorRefsFromIni = false;
                 bool excludeInteriorDoorBasesFromIni = false;
                 bool excludeLoadDoorBasesFromIni = false;
-                bool pullLoadDoorRefsFromIni = false;
                 bool excludeLockpickCrimeDoorBasesFromIni = false;
                 bool extendedSessionStartDoorBasesFromIni = false;
+                bool shortSessionStartDoorBasesFromIni = false;
+                bool shortSessionDoorRefsFromIni = false;
 
                 while (std::getline(file, line))
                 {
@@ -414,6 +468,12 @@ namespace InteractiveLockpickingVR {
                             {
                                 extendedSessionStartDoorBases.clear();
                                 extendedSessionStartDoorBasesFromIni = true;
+                            }
+                            else if (currentSection == "ShortSessionStartDoorBases"
+                                && !shortSessionStartDoorBasesFromIni)
+                            {
+                                shortSessionStartDoorBases.clear();
+                                shortSessionStartDoorBasesFromIni = true;
                             }
                         }
                     }
@@ -441,7 +501,31 @@ namespace InteractiveLockpickingVR {
                             AppendExtendedSessionStartDoorBase(line);
                         }
                     }
-                    else if (currentSection == "Settings") 
+                    else if (currentSection == "ShortSessionStartDoorBases")
+                    {
+                        if (!line.empty() && (line[0] == ';' || line[0] == '#'))
+                            continue;
+
+                        std::string variableName;
+                        std::string variableValueStr = GetConfigSettingsStringValue(line, variableName);
+                        if (variableName == "ShortSessionStartDistance")
+                        {
+                            shortSessionStartDistance = std::stof(variableValueStr);
+                        }
+                        else if (variableName == "ShortSessionEndDistance")
+                        {
+                            shortSessionEndDistance = std::stof(variableValueStr);
+                        }
+                        else if (line.find('=') != std::string::npos)
+                        {
+                            _MESSAGE("InteractiveDoorActions.ini: unknown key '%s' in [ShortSessionStartDoorBases] (expected ShortSessionStartDistance, ShortSessionEndDistance, or Plugin.esp|FormIdHex)", variableName.c_str());
+                        }
+                        else
+                        {
+                            AppendShortSessionStartDoorBase(line);
+                        }
+                    }
+                    else if (currentSection == "Settings")
                     {
                         std::string variableName;
                         std::string variableValueStr = GetConfigSettingsStringValue(line, variableName);
@@ -514,6 +598,14 @@ namespace InteractiveLockpickingVR {
                         {
                             extendedSessionEndDistance = std::stof(variableValueStr);
                         }
+                        else if (variableName == "ShortSessionStartDistance")
+                        {
+                            shortSessionStartDistance = std::stof(variableValueStr);
+                        }
+                        else if (variableName == "ShortSessionEndDistance")
+                        {
+                            shortSessionEndDistance = std::stof(variableValueStr);
+                        }
                         else if (variableName == "DoorSessionEndDistance")
                         {
                             doorSessionEndDistance = std::stof(variableValueStr);
@@ -562,6 +654,12 @@ namespace InteractiveLockpickingVR {
                             if (lockpickBreakRollIntervalMs < 100)
                                 lockpickBreakRollIntervalMs = 100;
                         }
+                        else if (variableName == "LockpickBreakMinGapMs")
+                        {
+                            lockpickBreakMinGapMs = std::stoi(variableValueStr);
+                            if (lockpickBreakMinGapMs < 0)
+                                lockpickBreakMinGapMs = 0;
+                        }
                         else if (variableName == "LockpickBreakSoundVolume")
                         {
                             lockpickBreakSoundVolume = std::stof(variableValueStr);
@@ -599,6 +697,15 @@ namespace InteractiveLockpickingVR {
                             }
                             AppendExcludedDoorRef(variableValueStr);
                         }
+                        else if (variableName == "ShortSessionDoorRefs")
+                        {
+                            if (!shortSessionDoorRefsFromIni)
+                            {
+                                shortSessionDoorRefs.clear();
+                                shortSessionDoorRefsFromIni = true;
+                            }
+                            AppendShortSessionDoorRef(variableValueStr);
+                        }
                         else if (variableName == "ExcludeInteriorDoorBases")
                         {
                             if (!excludeInteriorDoorBasesFromIni)
@@ -616,15 +723,6 @@ namespace InteractiveLockpickingVR {
                                 excludeLoadDoorBasesFromIni = true;
                             }
                             AppendExcludedLoadDoorBase(variableValueStr);
-                        }
-                        else if (variableName == "PullLoadDoorRefs")
-                        {
-                            if (!pullLoadDoorRefsFromIni)
-                            {
-                                pullLoadDoorRefs.clear();
-                                pullLoadDoorRefsFromIni = true;
-                            }
-                            AppendPullLoadDoorRef(variableValueStr);
                         }
                         else if (variableName == "ExcludeLockpickCrimeDoorBases")
                         {
