@@ -61,6 +61,11 @@ namespace InteractiveLockpickingVR {
 	extern float unlockedDoorTouchDistance;
 	extern int unlockedDoorPush;
 	extern int unlockedDoorSpawnDummy;
+	extern int unlockedDoorPushHand;
+	extern float unlockedDoorPushHapticStrength;
+	extern int unlockedDoorPushHapticLengthMs;
+	extern int unlockedDoorUsePhysicsRaycast;
+	extern float unlockedDoorHandRayLength;
 	extern int keyDoorActions;
 
 	// Door refs excluded from physical door interaction (100% vanilla).

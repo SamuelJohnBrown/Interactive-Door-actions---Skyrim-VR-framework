@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "CrimeBounty.h"
+#include "DoorHandRaycast.h"
 #include "LockpickBreak.h"
 #include "LockpickNotify.h"
 #include "LockpickSkillXp.h"
@@ -31,7 +32,6 @@
 #include <cmath>
 #include <cstring>
 #include <thread>
-#include <unordered_set>
 
 namespace InteractiveLockpickingVR
 {
@@ -51,9 +51,16 @@ namespace InteractiveLockpickingVR
 			0x0006597B,
 		};
 
-		// Skyrim.esm door bases fully excluded (100% vanilla: no push, no lockpick).
+		// Skyrim.esm door bases fully excluded (100% vanilla: no push, no lockpick, no key actions).
 		constexpr UInt32 kFullyExcludedDoorBaseFormIds[] = {
-			0x00097BE6,
+			0x0005AD3C,  // TrapdoorLadder01
+			0x0002834E,  // ShipTrapdoor01
+			0x000A760E,  // WRPrisonCellFloorGrate01Door
+		};
+
+		// Skyrim.esm door refs excluded from VR key-unlock only (lockpick/push unchanged).
+		constexpr UInt32 kKeyExcludedDoorRefLocalFormIds[] = {
+			0x000387B9,
 		};
 
 		// DOOR base forms used by wilderness cave mouths (NorDoor* etc.). Matched on
@@ -130,19 +137,6 @@ namespace InteractiveLockpickingVR
 		typedef bool (*_TESObjectREFR_Activate)(TESObjectREFR* activatee, TESObjectREFR* activator, UInt32 unk01, UInt32 unk02, UInt32 count, bool defaultProcessingOnly);
 		static RelocAddr<_TESObjectREFR_Activate> Activate_Native(0x002A8300);
 
-		// BGSOpenCloseForm::GetOpenState - CommonLibVR VR 1.4.15 offset.
-		enum DoorOpenState : UInt32
-		{
-			kDoorOpenStateNone = 0,
-			kDoorOpenStateOpen = 1,
-			kDoorOpenStateOpening = 2,
-			kDoorOpenStateClosed = 3,
-			kDoorOpenStateClosing = 4
-		};
-
-		typedef UInt32 (*_BGSOpenCloseForm_GetOpenState)(const TESObjectREFR* refr);
-		static RelocAddr<_BGSOpenCloseForm_GetOpenState> BGSOpenCloseForm_GetOpenState(0x00199480);
-
 		// TESObjectREFR::Activate detour (Fake Edge VR pattern). Blocks vanilla
 		// player activation of the held session item and of load doors; our own
 		// code activates through the bypass flag.
@@ -213,36 +207,32 @@ namespace InteractiveLockpickingVR
 		bool s_monitorThreadStarted = false;
 		constexpr int kMonitorIntervalMs = 100;
 
-		// "No longer in front of the door" for dummy sessions: farther than
+		// "No longer in front of the door" for key-door sessions: farther than
 		// DoorSessionEndDistance, or facing away from the door by more than
 		// ~90 degrees. Within kDummyNearDistance the facing test is skipped:
 		// at point-blank range the direction to the door's origin (its hinge)
 		// is unreliable.
 		constexpr float kDummyNearDistance = 150.0f;
 		constexpr float kDummyFacingDotMin = 0.0f;
-		// Push sessions: end when the player body walks away from the door
-		// (e.g. backward while still facing it). Stops arms-extended retreat
-		// from registering as a late hand push.
-		constexpr float kPushSessionRetreatMinMove = 1.25f;
-		constexpr float kPushSessionRetreatDotMin = 0.25f;
 
 		// Touch hysteresis: entering contact uses lockpickTouchDistance, but
 		// once touching, contact only breaks beyond that + this slack. Without
 		// it, hand jitter right at the threshold keeps resetting the hold timer.
 		constexpr float kTouchExitSlack = 4.0f;
 
-		// Short time-based cooldown so a just-ended session doesn't instantly
-		// respawn a lockpick at the same door.
-		std::chrono::steady_clock::time_point s_lastSessionEndTime{};
-		constexpr int kRestartCooldownMs = 1500;
-
-		// After a load-door activation, block new door sessions until the cell
-		// transition finishes. Without this the monitor thread can start a fresh
-		// hand-push session during the fade and stall the teleport (black screen,
-		// old-cell audio).
-		std::chrono::steady_clock::time_point s_loadDoorTransitionCooldownUntil{};
-		constexpr int kLoadDoorTransitionCooldownMs = 5000;
+		// Brief pause before Activate on load doors so EndLockpickSession
+		// cleanup settles before the cell transition starts.
 		constexpr int kLoadDoorActivateDelayMs = 350;
+
+		// After a successful push-open haptic, suppress further push haptics
+		// (e.g. next door's contact pulse) briefly.
+		std::chrono::steady_clock::time_point s_doorPushHapticCooldownUntil{};
+		constexpr int kDoorPushHapticCooldownMs = 1500;
+
+		// After an interior non-load door is push-activated, block another
+		// interior door activate briefly (open or close).
+		std::chrono::steady_clock::time_point s_interiorDoorActivateCooldownUntil{};
+		constexpr int kInteriorDoorActivateCooldownMs = 1500;
 
 		// While a load-door push is activating, skip re-equipping the cached weapon.
 		// Doing that during the fade stalls the cell transition (black screen).
@@ -250,22 +240,6 @@ namespace InteractiveLockpickingVR
 		UInt32 s_deferredHandRestoreFormId = 0;
 		bool s_deferredHandRestoreIsSpell = false;
 		bool s_deferredHandRestoreIsLeft = false;
-
-		bool IsLoadDoorTransitionCooldownActive()
-		{
-			return s_loadDoorTransitionCooldownUntil != std::chrono::steady_clock::time_point{}
-				&& std::chrono::steady_clock::now() < s_loadDoorTransitionCooldownUntil;
-		}
-
-		void ArmLoadDoorTransitionCooldown()
-		{
-			s_loadDoorTransitionCooldownUntil = std::chrono::steady_clock::now()
-				+ std::chrono::milliseconds(kLoadDoorTransitionCooldownMs);
-			s_crosshairDoorFormId = 0;
-			s_crosshairKeyDoorFormId = 0;
-			LOG_INFO("Door lockpick: load-door transition cooldown armed (%d ms)",
-				kLoadDoorTransitionCooldownMs);
-		}
 
 		// Touch-to-unlock: lockpick + shiv both at the door, close together,
 		// for a duration based on lock difficulty clears REFR_LOCK::kFlag_Locked.
@@ -336,24 +310,11 @@ namespace InteractiveLockpickingVR
 		// All doors open by pushing the hand toward the door along this axis.
 		NiPoint3 s_sessionToPlayerDir{};
 		bool s_hasSessionToPlayerDir = false;
-		NiPoint3 s_sessionLastPlayerPos{};
-		bool s_hasSessionLastPlayerPos = false;
-
-		// Per placed REFR FormID: interior non-load doors we opened via push
-		// stay in vanilla-close mode until closed (A button or auto-close sync).
-		std::unordered_set<UInt32> s_interiorDoorsAwaitingVanillaClose;
 
 		long long NowMs()
 		{
 			return std::chrono::duration_cast<std::chrono::milliseconds>(
 				std::chrono::steady_clock::now().time_since_epoch()).count();
-		}
-
-		bool IsRestartCooldownActive()
-		{
-			const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-				std::chrono::steady_clock::now() - s_lastSessionEndTime).count();
-			return elapsed >= 0 && elapsed < kRestartCooldownMs;
 		}
 
 		float DistanceBetween(const NiPoint3& a, const NiPoint3& b)
@@ -674,9 +635,20 @@ namespace InteractiveLockpickingVR
 			TriggerHapticOnControllers(openVR->vrSystem, mainController, offController, 3199);
 		}
 
-		// Short pulse on the hand that just pushed/pulled the door open.
-		void PulseDoorOpenGestureHaptic(bool mainHandIsLeft)
+		// Short pulse on the push hand (contact or successful open).
+		// Success pulses always play and arm a short cooldown so the next
+		// contact haptic cannot fire immediately after opening a door.
+		void PulseDoorOpenGestureHaptic(bool mainHandIsLeft, bool isSuccessPulse = false)
 		{
+			if (unlockedDoorPushHapticStrength <= 0.0f)
+				return;
+
+			const auto now = std::chrono::steady_clock::now();
+			if (!isSuccessPulse
+				&& s_doorPushHapticCooldownUntil != std::chrono::steady_clock::time_point{}
+				&& now < s_doorPushHapticCooldownUntil)
+				return;
+
 			BSOpenVR* openVR = *g_openVR;
 			if (!openVR || !openVR->vrSystem)
 				return;
@@ -691,8 +663,41 @@ namespace InteractiveLockpickingVR
 			if (controller == vr_1_0_12::k_unTrackedDeviceIndexInvalid)
 				return;
 
-			constexpr unsigned short kDoorPushOpenPulseUs = 1200;
-			openVR->vrSystem->TriggerHapticPulse(controller, 0, kDoorPushOpenPulseUs);
+			const unsigned short pulseUs = static_cast<unsigned short>(
+				unlockedDoorPushHapticStrength * 3999.0f);
+			if (pulseUs == 0)
+				return;
+
+			const int lengthMs = unlockedDoorPushHapticLengthMs;
+			if (lengthMs <= 0)
+			{
+				openVR->vrSystem->TriggerHapticPulse(controller, 0, pulseUs);
+			}
+			else
+			{
+				std::thread([controller, pulseUs, lengthMs]()
+				{
+					BSOpenVR* openVRThread = *g_openVR;
+					if (!openVRThread || !openVRThread->vrSystem)
+						return;
+
+					vr_1_0_12::IVRSystem* ivrSystem = openVRThread->vrSystem;
+					constexpr int kPulseIntervalMs = 8;
+					const auto start = std::chrono::steady_clock::now();
+					while (std::chrono::duration_cast<std::chrono::milliseconds>(
+						std::chrono::steady_clock::now() - start).count() < lengthMs)
+					{
+						ivrSystem->TriggerHapticPulse(controller, 0, pulseUs);
+						std::this_thread::sleep_for(std::chrono::milliseconds(kPulseIntervalMs));
+					}
+				}).detach();
+			}
+
+			if (isSuccessPulse)
+			{
+				s_doorPushHapticCooldownUntil = now
+					+ std::chrono::milliseconds(kDoorPushHapticCooldownMs);
+			}
 		}
 
 		// Sustained strong rumble on successful unlock (runs off the game thread).
@@ -930,15 +935,47 @@ namespace InteractiveLockpickingVR
 			return ref->parentCell && IsInteriorCell(ref->parentCell);
 		}
 
+		bool IsInteriorDoorActivateCooldownActive()
+		{
+			return s_interiorDoorActivateCooldownUntil != std::chrono::steady_clock::time_point{}
+				&& std::chrono::steady_clock::now() < s_interiorDoorActivateCooldownUntil;
+		}
+
+		void ArmInteriorDoorActivateCooldown()
+		{
+			s_interiorDoorActivateCooldownUntil = std::chrono::steady_clock::now()
+				+ std::chrono::milliseconds(kInteriorDoorActivateCooldownMs);
+		}
+
+		bool ShouldBlockInteriorDoorActivate(TESObjectREFR* doorRef)
+		{
+			return IsInteriorNonLoadDoor(doorRef) && IsInteriorDoorActivateCooldownActive();
+		}
+
 		bool IsFullyExcludedDoorBase(TESObjectREFR* ref)
 		{
 			if (!ref || !ref->baseForm)
 				return false;
 
-			const UInt32 baseFormId = ref->baseForm->formID;
+			const UInt32 baseLocal = ref->baseForm->formID & 0x00FFFFFF;
 			for (UInt32 excludedId : kFullyExcludedDoorBaseFormIds)
 			{
-				if (baseFormId == excludedId)
+				if (baseLocal == (excludedId & 0x00FFFFFF))
+					return true;
+			}
+
+			return false;
+		}
+
+		bool IsKeyExcludedDoorRef(TESObjectREFR* ref)
+		{
+			if (!ref)
+				return false;
+
+			const UInt32 refLocal = ref->formID & 0x00FFFFFF;
+			for (UInt32 excludedId : kKeyExcludedDoorRefLocalFormIds)
+			{
+				if (refLocal == (excludedId & 0x00FFFFFF))
 					return true;
 			}
 
@@ -962,66 +999,9 @@ namespace InteractiveLockpickingVR
 			return IsInteriorNonLoadDoor(ref) && IsExcludedInteriorDoorBase(ref);
 		}
 
-		bool IsInteriorDoorAwaitingVanillaClose(TESObjectREFR* ref)
-		{
-			return ref && s_interiorDoorsAwaitingVanillaClose.count(ref->formID) != 0;
-		}
-
-		void MarkInteriorDoorAwaitingVanillaClose(UInt32 doorFormId)
-		{
-			s_interiorDoorsAwaitingVanillaClose.insert(doorFormId);
-		}
-
-		void ClearInteriorDoorAwaitingVanillaClose(UInt32 doorFormId)
-		{
-			s_interiorDoorsAwaitingVanillaClose.erase(doorFormId);
-		}
-
-		DoorOpenState GetDoorOpenState(TESObjectREFR* ref)
-		{
-			if (!ref)
-				return kDoorOpenStateNone;
-
-			return static_cast<DoorOpenState>(BGSOpenCloseForm_GetOpenState(ref));
-		}
-
-		bool IsDoorPhysicallyOpen(TESObjectREFR* ref)
-		{
-			const DoorOpenState state = GetDoorOpenState(ref);
-			return state == kDoorOpenStateOpen || state == kDoorOpenStateOpening;
-		}
-
-		bool IsDoorPhysicallyClosed(TESObjectREFR* ref)
-		{
-			const DoorOpenState state = GetDoorOpenState(ref);
-			return state == kDoorOpenStateClosed || state == kDoorOpenStateClosing;
-		}
-
-		bool IsNonLoadDoorWithVanillaCloseToggle(TESObjectREFR* ref)
-		{
-			return IsInteriorNonLoadDoor(ref) && !IsExcludedInteriorDoorBase(ref);
-		}
-
-		// If this ref was left in vanilla-close mode but the door is physically
-		// closed again (auto-close, load, etc.), restore push logic for it only.
-		void SyncDoorAwaitingVanillaCloseState(TESObjectREFR* ref)
-		{
-			if (!ref || !IsNonLoadDoorWithVanillaCloseToggle(ref))
-				return;
-
-			if (IsInteriorDoorAwaitingVanillaClose(ref) && IsDoorPhysicallyClosed(ref))
-			{
-				ClearInteriorDoorAwaitingVanillaClose(ref->formID);
-				LOG_INFO("Door lockpick: door %08X is closed, push logic restored for this ref",
-					ref->formID);
-			}
-		}
-
 		bool IsInteriorNonLoadDoorUsingPushLogic(TESObjectREFR* ref)
 		{
-			return IsInteriorNonLoadDoor(ref)
-				&& !IsExcludedInteriorDoorBase(ref)
-				&& !IsInteriorDoorAwaitingVanillaClose(ref);
+			return IsInteriorNonLoadDoor(ref) && !IsExcludedInteriorDoorBase(ref);
 		}
 
 		// Hard-coded push exclusions — lockpicking unchanged; push and hidden
@@ -1097,35 +1077,6 @@ namespace InteractiveLockpickingVR
 				return true;
 
 			return IsPlayerFacingDoor(player, doorRef);
-		}
-
-		bool IsPlayerWalkingAwayFromDoor(PlayerCharacter* player)
-		{
-			if (!player || !s_hasSessionLastPlayerPos || !s_hasSessionToPlayerDir)
-				return false;
-
-			NiPoint3 move;
-			move.x = player->pos.x - s_sessionLastPlayerPos.x;
-			move.y = player->pos.y - s_sessionLastPlayerPos.y;
-			move.z = 0.0f;
-
-			const float moveLenSq = move.x * move.x + move.y * move.y;
-			const float minMoveSq = kPushSessionRetreatMinMove * kPushSessionRetreatMinMove;
-			if (moveLenSq < minMoveSq)
-				return false;
-
-			const float moveLen = std::sqrt(moveLenSq);
-			const float awayDot = (move.x * s_sessionToPlayerDir.x + move.y * s_sessionToPlayerDir.y) / moveLen;
-			return awayDot >= kPushSessionRetreatDotMin;
-		}
-
-		void TrackSessionPlayerPosition(PlayerCharacter* player)
-		{
-			if (!player)
-				return;
-
-			s_sessionLastPlayerPos = player->pos;
-			s_hasSessionLastPlayerPos = true;
 		}
 
 		bool IsAutoLoadStyleDoor(TESObjectREFR* ref)
@@ -1682,59 +1633,153 @@ namespace InteractiveLockpickingVR
 			return atSlab || probeHit || (nearDoor && (wasTouching || collisionFresh));
 		}
 
-		// Either game hand can start/maintain a hand-push session; locks to the active hand until contact breaks.
-		bool EvaluateHandPushDoorContact(PlayerCharacter* player, TESObjectREFR* doorRef,
-			NiPoint3& outHandPos, float& outPlaneDist, bool& outAtSlab, bool& outProbeHit)
+		// UnlockedDoorPushHand:
+		//  0 = main hand only
+		//  1 = off hand only
+		//  2 = either hand — no hand lock; whichever hand has real contact wins.
+		bool IsGameHandAllowedForDoorPush(bool isLeftGameHand)
 		{
-			auto tryHand = [&](bool isLeftGameHand) -> bool
+			const bool mainHandIsLeft = IsMainHandLeftGameHand();
+			switch (unlockedDoorPushHand)
 			{
-				NiPoint3 handPos;
-				if (!TryGetGameHandWorldPos(player, isLeftGameHand, handPos))
-					return false;
+			case 1:
+				return isLeftGameHand != mainHandIsLeft;
+			case 2:
+				return true;
+			default:
+				return isLeftGameHand == mainHandIsLeft;
+			}
+		}
 
-				const bool handWasTouching = s_touching && s_sessionPushHandActive && s_sessionPushHandIsLeft == isLeftGameHand;
+		bool EvaluateHandPushDoorContact(PlayerCharacter* player, TESObjectREFR* doorRef,
+			NiPoint3& outHandPos, float& outPlaneDist, bool& outAtSlab, bool& outProbeHit, bool& outPhysicsHit)
+		{
+			outPhysicsHit = false;
+
+			struct HandProbe
+			{
+				bool valid = false;
+				bool hard = false; // raycast / slab / probe — real contact
+				NiPoint3 pos{};
+				float planeDist = 9999.0f;
+				bool atSlab = false;
+				bool probeHit = false;
+				bool physicsHit = false;
+			};
+
+			auto probeHand = [&](bool isLeftGameHand) -> HandProbe
+			{
+				HandProbe result;
+				if (!IsGameHandAllowedForDoorPush(isLeftGameHand))
+					return result;
+
+				if (!TryGetGameHandWorldPos(player, isLeftGameHand, result.pos))
+					return result;
+
+				const bool handWasTouching = s_touching && s_sessionPushHandActive
+					&& s_sessionPushHandIsLeft == isLeftGameHand;
+				const float rayLength = handWasTouching
+					? unlockedDoorHandRayLength + kTouchExitSlack
+					: unlockedDoorHandRayLength;
+
+				NiPoint3 hitNormal;
+				if (IsDoorHandRaycastEnabled())
+				{
+					result.physicsHit = IsHandTouchingDoorViaRaycast(doorRef, result.pos, rayLength,
+						result.planeDist, hitNormal);
+				}
+
 				const float slabDist = handWasTouching
 					? unlockedDoorTouchDistance + kTouchExitSlack
 					: unlockedDoorTouchDistance;
-				const bool atSlab = IsPickAtDoorSlab(doorRef, handPos, slabDist);
+				result.atSlab = !result.physicsHit && IsPickAtDoorSlab(doorRef, result.pos, slabDist);
 
-				float planeDist = 9999.0f;
 				bool probeTouchState = handWasTouching;
-				const bool probeHit = IsPickTouchingDoor(doorRef, handPos, player->pos,
-					unlockedDoorTouchDistance, probeTouchState, planeDist);
-				const bool nearDoor = IsPickNearDoorBounds(doorRef, handPos, kDummyNearBoundsMargin);
-				const long long collisionMs = isLeftGameHand
-					? s_lastLeftGameHandDoorCollisionMs.load()
-					: s_lastRightGameHandDoorCollisionMs.load();
-				const bool collisionFresh = (NowMs() - collisionMs) <= kCollisionFreshMs;
-				const bool touching = atSlab || probeHit || (nearDoor && (handWasTouching || collisionFresh));
+				result.probeHit = !result.physicsHit && IsPickTouchingDoor(doorRef, result.pos, player->pos,
+					unlockedDoorTouchDistance, probeTouchState, result.planeDist);
 
-				if (!touching)
-					return false;
+				result.hard = result.physicsHit || result.atSlab || result.probeHit;
 
-				outHandPos = handPos;
-				outPlaneDist = planeDist;
-				outAtSlab = atSlab;
-				outProbeHit = probeHit;
-
-				if (!s_sessionPushHandActive)
+				// Sticky near-bounds only for single-hand modes (reduces flicker).
+				// Either-hand must not keep a withdrawn hand "touching" or it blocks
+				// the other hand from registering.
+				if (unlockedDoorPushHand != 2 && !result.hard)
 				{
-					s_sessionPushHandIsLeft = isLeftGameHand;
-					s_sessionPushHandActive = true;
+					const bool nearDoor = IsPickNearDoorBounds(doorRef, result.pos, kDummyNearBoundsMargin);
+					const long long collisionMs = isLeftGameHand
+						? s_lastLeftGameHandDoorCollisionMs.load()
+						: s_lastRightGameHandDoorCollisionMs.load();
+					const bool collisionFresh = (NowMs() - collisionMs) <= kCollisionFreshMs;
+					if (nearDoor && (handWasTouching || collisionFresh))
+						result.valid = true;
 				}
-				return true;
+				else
+				{
+					result.valid = result.hard;
+				}
+
+				return result;
 			};
 
-			if (s_sessionPushHandActive)
+			auto acceptHand = [&](bool isLeftGameHand, const HandProbe& probe)
 			{
-				if (!tryHand(s_sessionPushHandIsLeft))
+				if (s_sessionPushHandActive && s_sessionPushHandIsLeft != isLeftGameHand)
+				{
+					s_touching = false;
+					s_hasTouchAnchor = false;
+					LOG_INFO("Door push: using %s hand", isLeftGameHand ? "left" : "right");
+				}
+
+				outHandPos = probe.pos;
+				outPlaneDist = probe.planeDist;
+				outAtSlab = probe.atSlab;
+				outProbeHit = probe.probeHit;
+				outPhysicsHit = probe.physicsHit;
+				s_sessionPushHandIsLeft = isLeftGameHand;
+				s_sessionPushHandActive = true;
+			};
+
+			if (unlockedDoorPushHand == 2)
+			{
+				const HandProbe left = probeHand(true);
+				const HandProbe right = probeHand(false);
+
+				if (!left.valid && !right.valid)
+				{
 					s_sessionPushHandActive = false;
-				return s_sessionPushHandActive;
+					return false;
+				}
+
+				bool pickLeft = left.valid;
+				if (left.valid && right.valid)
+				{
+					// No hand lock — prefer real raycast, then closer contact.
+					if (left.hard != right.hard)
+						pickLeft = left.hard;
+					else if (left.physicsHit != right.physicsHit)
+						pickLeft = left.physicsHit;
+					else
+						pickLeft = left.planeDist <= right.planeDist;
+				}
+
+				if (pickLeft)
+					acceptHand(true, left);
+				else
+					acceptHand(false, right);
+				return true;
 			}
 
-			if (tryHand(true))
-				return true;
-			return tryHand(false);
+			const bool mainHandIsLeft = IsMainHandLeftGameHand();
+			const bool pushHandIsLeft = (unlockedDoorPushHand == 1) ? !mainHandIsLeft : mainHandIsLeft;
+			const HandProbe probe = probeHand(pushHandIsLeft);
+			if (!probe.valid)
+			{
+				s_sessionPushHandActive = false;
+				return false;
+			}
+
+			acceptHand(pushHandIsLeft, probe);
+			return true;
 		}
 
 		void RemoveItemSilent(TESObjectREFR* target, TESForm* item, SInt32 count)
@@ -1942,26 +1987,6 @@ namespace InteractiveLockpickingVR
 				{
 					LOG_INFO("Door lockpick: blocked activation of held session item %08X", activatee->formID);
 					return false;
-				}
-
-				// Per-ref toggle: while this ref is open from our push, vanilla A
-				// closes it and clears only this ref's state.
-				if (doorLockpick != 0 && IsNonLoadDoorWithVanillaCloseToggle(activatee))
-				{
-					SyncDoorAwaitingVanillaCloseState(activatee);
-
-					if (IsInteriorDoorAwaitingVanillaClose(activatee))
-					{
-						const bool wasOpen = IsDoorPhysicallyOpen(activatee);
-						const bool result = CallOriginalActivate(activatee, activator, unk01, unk02, count, defaultProcessingOnly);
-						if (wasOpen)
-						{
-							ClearInteriorDoorAwaitingVanillaClose(activatee->formID);
-							LOG_INFO("Door lockpick: door %08X closed via vanilla, push logic restored for this ref",
-								activatee->formID);
-						}
-						return result;
-					}
 				}
 
 				// Block the A button on unlocked doors that open through the
@@ -2440,7 +2465,6 @@ namespace InteractiveLockpickingVR
 			s_hasTouchAnchor = false;
 			s_hasDoorThinAxis = false;
 			s_hasDoorPushDir = false;
-			s_lastSessionEndTime = std::chrono::steady_clock::now();
 		}
 
 		bool PlayerHasLockpick(PlayerCharacter* player, TESForm* lockpickForm)
@@ -2644,7 +2668,11 @@ namespace InteractiveLockpickingVR
 
 				const bool loadDoor = IsLoadDoor(doorRef);
 				if (loadDoor)
-					ArmLoadDoorTransitionCooldown();
+				{
+					s_crosshairDoorFormId = 0;
+					s_crosshairKeyDoorFormId = 0;
+					s_crosshairCaveDoorFormId = 0;
+				}
 
 				const bool activated = ActivateRef(doorRef, player);
 				if (loadDoor)
@@ -2669,14 +2697,10 @@ namespace InteractiveLockpickingVR
 						}).detach();
 					}
 				}
-				else if (IsNonLoadDoorWithVanillaCloseToggle(doorRef) && IsDoorPhysicallyOpen(doorRef))
-				{
-					MarkInteriorDoorAwaitingVanillaClose(m_doorFormId);
-					LOG_INFO("Door lockpick: door %08X opened via push, vanilla close until toggled (this ref only)",
-						m_doorFormId);
-				}
 				else
 				{
+					if (IsInteriorNonLoadDoor(doorRef))
+						ArmInteriorDoorActivateCooldown();
 					LOG_INFO("Door lockpick: door %08X activated", m_doorFormId);
 				}
 			}
@@ -2792,26 +2816,141 @@ namespace InteractiveLockpickingVR
 					return;
 				}
 
-				if (DistanceBetween(player->pos, doorRef->pos) > GetDoorSessionEndDistance(doorRef))
+				// Unlocked push (hand/dummy) uses raycast contact — no player-to-door
+				// origin distance. Lockpick/key sessions still end when walking away.
+				if (!s_sessionIsHandPush && !s_sessionIsDummy)
 				{
-					LOG_INFO("Door lockpick: player moved away from door, ending session");
-					EndLockpickSession();
-					return;
+					if (DistanceBetween(player->pos, doorRef->pos) > GetDoorSessionEndDistance(doorRef))
+					{
+						LOG_INFO("Door lockpick: player moved away from door, ending session");
+						EndLockpickSession();
+						return;
+					}
 				}
 
 				if (s_sessionIsDummy || s_sessionIsHandPush)
 				{
-					if (IsPlayerWalkingAwayFromDoor(player))
+					if (s_sessionIsHandPush)
 					{
-						LOG_INFO("Door lockpick: player walking away from door, ending %s session",
-							s_sessionIsHandPush ? "hand-push" : "dummy");
-						EndLockpickSession();
+						// Touch door (raycast/contact) → haptic → listen for forward push → open.
+						NiPoint3 contactPos;
+						float planeDist = 9999.0f;
+						bool atSlab = false;
+						bool probeHit = false;
+						bool physicsHit = false;
+						const bool handOnDoor = EvaluateHandPushDoorContact(player, doorRef,
+							contactPos, planeDist, atSlab, probeHit, physicsHit);
+
+						if (!handOnDoor)
+						{
+							s_touching = false;
+							s_hasTouchAnchor = false;
+							return;
+						}
+
+						if (!IsDoorUnlocked(doorRef))
+						{
+							LOG_INFO("Door lockpick: door became locked, ending hand-push session");
+							EndLockpickSession();
+							return;
+						}
+
+						NiPoint3 handPos = contactPos;
+						TryGetGameHandWorldPos(player, s_sessionPushHandIsLeft, handPos);
+
+						if (!s_touching)
+						{
+							s_touching = true;
+							s_touchStartTime = std::chrono::steady_clock::now();
+							SetPushTouchAnchor(handPos, player->pos);
+							PulseDoorOpenGestureHaptic(s_sessionPushHandIsLeft);
+							LOG_INFO("Door push: hand contact on door %08X (%s) — listening for forward push",
+								doorRef->formID,
+								physicsHit ? "raycast" : (atSlab ? "slab" : "probe"));
+							return;
+						}
+
+						if (!s_hasTouchAnchor)
+						{
+							SetPushTouchAnchor(handPos, player->pos);
+							return;
+						}
+
+						NiPoint3 openAxis = s_sessionToPlayerDir;
+						if (!s_hasSessionToPlayerDir)
+						{
+							openAxis = player->pos - GetDoorGeometryAnchor(doorRef);
+							if (!NormalizeHorizontalDir(openAxis))
+								return;
+						}
+
+						// openAxis = door → player. Forward push into door = opposite.
+						const NiPoint3 handRelNow{
+							handPos.x - player->pos.x,
+							handPos.y - player->pos.y,
+							handPos.z - player->pos.z };
+						const NiPoint3 handMove{
+							handRelNow.x - s_touchAnchorHandRelPlayer.x,
+							handRelNow.y - s_touchAnchorHandRelPlayer.y,
+							handRelNow.z - s_touchAnchorHandRelPlayer.z };
+						const float towardPlayer = handMove.x * openAxis.x
+							+ handMove.y * openAxis.y + handMove.z * openAxis.z;
+						const float openGestureDist = -towardPlayer;
+
+						if (openGestureDist < 0.0f)
+						{
+							// Hand retreated — re-anchor so the next forward push counts cleanly.
+							SetPushTouchAnchor(handPos, player->pos);
+							return;
+						}
+
+						if (openGestureDist >= unlockedDoorPushDistance)
+						{
+							if (ShouldBlockInteriorDoorActivate(doorRef))
+								return;
+
+							LOG_INFO("Door push: forward push (%.1f units), opening door %08X",
+								openGestureDist, doorRef->formID);
+
+							PulseDoorOpenGestureHaptic(s_sessionPushHandIsLeft, true);
+
+							const UInt32 doorFormId = doorRef->formID;
+							const bool loadDoor = IsLoadDoor(doorRef);
+							if (loadDoor)
+							{
+								if (s_cachedHandFormId != 0)
+								{
+									s_deferredHandRestoreFormId = s_cachedHandFormId;
+									s_deferredHandRestoreIsSpell = s_cachedHandIsSpell;
+									s_deferredHandRestoreIsLeft = s_mainHandIsLeft;
+								}
+								s_suppressHandRestore = true;
+								s_crosshairDoorFormId = 0;
+								s_crosshairKeyDoorFormId = 0;
+								s_crosshairCaveDoorFormId = 0;
+							}
+
+							EndLockpickSession();
+
+							if (loadDoor)
+							{
+								std::thread([doorFormId]()
+								{
+									std::this_thread::sleep_for(
+										std::chrono::milliseconds(kLoadDoorActivateDelayMs));
+									if (g_task)
+										g_task->AddTask(new ActivateDoorTask(doorFormId));
+								}).detach();
+							}
+							else if (g_task)
+							{
+								g_task->AddTask(new ActivateDoorTask(doorFormId));
+							}
+						}
 						return;
 					}
-					TrackSessionPlayerPosition(player);
 
-					// Push-to-open: contact uses the grabbed dummy's position,
-					// or either hand bone when UnlockedDoorSpawnDummy = 0.
+					// Dummy-item push path (UnlockedDoorSpawnDummy=1).
 					NiPoint3 contactPos;
 					bool haveContactPos = false;
 					float planeDist = 9999.0f;
@@ -2819,60 +2958,35 @@ namespace InteractiveLockpickingVR
 					bool probeHit = false;
 					bool touching = false;
 
-					if (s_sessionIsHandPush)
-					{
-						haveContactPos = EvaluateHandPushDoorContact(player, doorRef,
-							contactPos, planeDist, atSlab, probeHit);
-						touching = haveContactPos;
-					}
-					else
-					{
-						haveContactPos = TryGetLockpickWorldPos(contactPos);
+					haveContactPos = TryGetLockpickWorldPos(contactPos);
 
-						const float slabDist = s_touching
-							? unlockedDoorTouchDistance + kTouchExitSlack
-							: unlockedDoorTouchDistance;
-						atSlab = haveContactPos && IsPickAtDoorSlab(doorRef, contactPos, slabDist);
+					const float slabDist = s_touching
+						? unlockedDoorTouchDistance + kTouchExitSlack
+						: unlockedDoorTouchDistance;
+					atSlab = haveContactPos && IsPickAtDoorSlab(doorRef, contactPos, slabDist);
 
-						const bool nearDoor = haveContactPos
-							&& IsPickNearDoorBounds(doorRef, contactPos, kDummyNearBoundsMargin);
-						const bool collisionFresh = (NowMs() - s_lastDummyCollisionMs.load()) <= kCollisionFreshMs;
+					const bool nearDoor = haveContactPos
+						&& IsPickNearDoorBounds(doorRef, contactPos, kDummyNearBoundsMargin);
+					const bool collisionFresh = (NowMs() - s_lastDummyCollisionMs.load()) <= kCollisionFreshMs;
 
-						touching = atSlab || (nearDoor && (s_touching || collisionFresh));
-					}
-
-					// Push sessions end when the player is no longer in front
-					// of the door - but never while actively pressed against it.
-					if (!touching && !IsPlayerStillInFrontOfDoor(player, doorRef))
-					{
-						LOG_INFO("Door lockpick: player no longer in front of door, ending %s session",
-							s_sessionIsHandPush ? "hand-push" : "dummy");
-						EndLockpickSession();
-						return;
-					}
+					touching = atSlab || (nearDoor && (s_touching || collisionFresh));
 
 					if (!touching)
 					{
 						s_touching = false;
 						s_hasTouchAnchor = false;
-						if (s_sessionIsHandPush)
-							s_sessionPushHandActive = false;
 						return;
 					}
 
 					if (!IsDoorUnlocked(doorRef))
 					{
-						LOG_INFO("Door lockpick: door became locked, ending %s session",
-							s_sessionIsHandPush ? "hand-push" : "dummy");
+						LOG_INFO("Door lockpick: door became locked, ending dummy session");
 						EndLockpickSession();
 						return;
 					}
 
 					NiPoint3 handPos;
-					const bool haveHandPos = s_sessionIsHandPush
-						? (s_sessionPushHandActive
-							&& TryGetGameHandWorldPos(player, s_sessionPushHandIsLeft, handPos))
-						: TryGetMainHandWorldPos(player, handPos);
+					const bool haveHandPos = TryGetMainHandWorldPos(player, handPos);
 
 					if (!s_touching)
 					{
@@ -2882,18 +2996,8 @@ namespace InteractiveLockpickingVR
 							SetPushTouchAnchor(handPos, player->pos);
 						else
 							s_hasTouchAnchor = false;
-						if (s_sessionIsHandPush)
-						{
-							LOG_INFO("Door lockpick: hand contact with door %08X (%s, planeDist=%.1f)",
-								doorRef->formID,
-								atSlab ? "slab" : (probeHit ? "probe" : "HIGGS collision"),
-								planeDist);
-						}
-						else
-						{
-							LOG_INFO("Door lockpick: dummy contact with door %08X (%s)",
-								doorRef->formID, atSlab ? "slab" : "HIGGS collision");
-						}
+						LOG_INFO("Door lockpick: dummy contact with door %08X (%s)",
+							doorRef->formID, atSlab ? "slab" : "HIGGS collision");
 						return;
 					}
 
@@ -2906,8 +3010,6 @@ namespace InteractiveLockpickingVR
 						return;
 					}
 
-					// Open gesture = controller extension since contact (hand offset
-					// from the player body), not world-space hand drift from walking.
 					NiPoint3 openAxis = s_sessionToPlayerDir;
 					if (!s_hasSessionToPlayerDir)
 					{
@@ -2935,17 +3037,16 @@ namespace InteractiveLockpickingVR
 
 					if (openGestureDist >= unlockedDoorPushDistance)
 					{
-						if (!IsPlayerFacingDoor(player, doorRef))
+						if (ShouldBlockInteriorDoorActivate(doorRef))
 							return;
 
 						LOG_INFO("Door lockpick: push detected (%.1f units), activating unlocked door %08X",
 							openGestureDist,
 							doorRef->formID);
 
-						PulseDoorOpenGestureHaptic(s_sessionIsHandPush ? s_sessionPushHandIsLeft : s_mainHandIsLeft);
+						PulseDoorOpenGestureHaptic(s_mainHandIsLeft, true);
 
 						const UInt32 doorFormId = doorRef->formID;
-						const bool handPush = s_sessionIsHandPush;
 						const bool loadDoor = IsLoadDoor(doorRef);
 
 						if (loadDoor)
@@ -2957,7 +3058,9 @@ namespace InteractiveLockpickingVR
 								s_deferredHandRestoreIsLeft = s_mainHandIsLeft;
 							}
 							s_suppressHandRestore = true;
-							ArmLoadDoorTransitionCooldown();
+							s_crosshairDoorFormId = 0;
+							s_crosshairKeyDoorFormId = 0;
+							s_crosshairCaveDoorFormId = 0;
 						}
 
 						EndLockpickSession();
@@ -2971,16 +3074,8 @@ namespace InteractiveLockpickingVR
 									g_task->AddTask(new ActivateDoorTask(doorFormId));
 							}).detach();
 						}
-						else if (handPush)
-						{
-							if (g_task)
-								g_task->AddTask(new ActivateDoorTask(doorFormId));
-						}
 						else
 						{
-							// The grabbed dummy must be fully gone from the world
-							// before the door is activated, or the activation gets
-							// eaten.
 							std::thread([doorFormId]()
 							{
 								std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -3270,6 +3365,9 @@ namespace InteractiveLockpickingVR
 			if (!door || s_sessionActive || doorLockpick == 0)
 				return;
 
+			if (IsKeyExcludedDoorRef(door))
+				return;
+
 			if (!IsDoorLockedAndRequiresKey(door))
 				return;
 
@@ -3285,9 +3383,6 @@ namespace InteractiveLockpickingVR
 				return;
 
 			if (!IsPlayerWithinSessionStartDistance(door))
-				return;
-
-			if (IsRestartCooldownActive())
 				return;
 
 			if (!higgsInterface)
@@ -3372,6 +3467,12 @@ namespace InteractiveLockpickingVR
 			if (!doorRef || !IsDoorLockedAndRequiresKey(doorRef) || s_sessionActive)
 				return;
 
+			if (IsVanillaDoorOnly(doorRef))
+				return;
+
+			if (IsKeyExcludedDoorRef(doorRef))
+				return;
+
 			PlayerCharacter* player = *g_thePlayer;
 			if (!player)
 				return;
@@ -3413,9 +3514,6 @@ namespace InteractiveLockpickingVR
 				s_sessionToPlayerDir = toPlayerDir;
 				s_hasSessionToPlayerDir = true;
 			}
-
-			s_sessionLastPlayerPos = playerPos;
-			s_hasSessionLastPlayerPos = true;
 
 			s_hasDoorPushDir = false;
 			NiPoint3 toDoorDir = doorAnchor - playerPos;
@@ -3492,19 +3590,14 @@ namespace InteractiveLockpickingVR
 
 		// Single-shot poll: crosshair can lock onto a door from far away but
 		// SKSE only fires the crosshair event on change, so we re-check every
-		// tick until the player walks within DoorSessionStartDistance.
+		// tick. Lockpick/key still wait for DoorSessionStartDistance; unlocked
+		// push starts immediately (raycast owns contact).
 		class SessionStartPollTask : public TaskDelegate
 		{
 		public:
 			virtual void Run() override
 			{
 				if (s_sessionActive || doorLockpick == 0 || s_crosshairDoorFormId == 0)
-					return;
-
-				if (IsLoadDoorTransitionCooldownActive())
-					return;
-
-				if (IsRestartCooldownActive())
 					return;
 
 				TESForm* doorForm = LookupFormByID(s_crosshairDoorFormId);
@@ -3515,11 +3608,6 @@ namespace InteractiveLockpickingVR
 				if (IsVanillaDoorOnly(doorRef))
 					return;
 
-				SyncDoorAwaitingVanillaCloseState(doorRef);
-
-				if (!IsPlayerWithinSessionStartDistance(doorRef))
-					return;
-
 				if (IsDoorLockedAndRequiresKey(doorRef))
 				{
 					if (keyDoorActions != 0)
@@ -3528,9 +3616,15 @@ namespace InteractiveLockpickingVR
 				}
 
 				if (IsDoorLockedAndPickable(doorRef))
+				{
+					if (!IsPlayerWithinSessionStartDistance(doorRef))
+						return;
 					StartLockpickSession(doorRef, false);
+				}
 				else if (IsUnlockedDoorSessionEligible(doorRef))
+				{
 					StartLockpickSession(doorRef, true);
+				}
 			}
 
 			virtual void Dispose() override
@@ -3541,7 +3635,7 @@ namespace InteractiveLockpickingVR
 
 		// Background heartbeat: posts one game-thread check per tick while a
 		// session is active, or polls for session start while the crosshair
-		// is on a door but the player is still walking into range.
+		// is on a door (unlocked push starts immediately; lockpick waits for range).
 		void StartMonitorThreadOnce()
 		{
 			if (s_monitorThreadStarted)
@@ -3579,16 +3673,12 @@ namespace InteractiveLockpickingVR
 			if (!door || s_sessionActive || doorLockpick == 0)
 				return;
 
-			if (IsLoadDoorTransitionCooldownActive())
-				return;
-
 			if (IsVanillaDoorOnly(door))
 				return;
 
-			if (!IsPlayerWithinSessionStartDistance(door))
-				return;
-
-			if (IsRestartCooldownActive())
+			// Unlocked push uses hand raycast for contact — no origin-distance gate.
+			// Lockpick sessions still require DoorSessionStartDistance.
+			if (!isDummy && !IsPlayerWithinSessionStartDistance(door))
 				return;
 
 			if (!higgsInterface)
@@ -3805,8 +3895,6 @@ namespace InteractiveLockpickingVR
 			s_hasDoorThinAxis = false;
 			s_hasDoorPushDir = false;
 			s_hasSessionToPlayerDir = false;
-			s_hasSessionLastPlayerPos = false;
-			s_loadDoorTransitionCooldownUntil = {};
 			s_suppressHandRestore = false;
 			s_deferredHandRestoreFormId = 0;
 			s_deferredHandRestoreIsSpell = false;
@@ -3909,7 +3997,7 @@ namespace InteractiveLockpickingVR
 			return IsUnlockedDoorSessionEligible(ref);
 
 		if (IsDoorLockedAndRequiresKey(ref))
-			return keyDoorActions != 0;
+			return keyDoorActions != 0 && !IsKeyExcludedDoorRef(ref);
 
 		if (IsDoorLockedAndPickable(ref))
 			return excludeLockedDoors == 0;
@@ -3919,14 +4007,14 @@ namespace InteractiveLockpickingVR
 
 	void OnLockpickCrosshairRefChanged(TESObjectREFR* crosshairRef)
 	{
-		if (keyDoorActions != 0 && crosshairRef && IsDoor(crosshairRef) && IsDoorLockedAndRequiresKey(crosshairRef))
+		if (keyDoorActions != 0 && crosshairRef && IsDoor(crosshairRef) && IsDoorLockedAndRequiresKey(crosshairRef)
+			&& !IsKeyExcludedDoorRef(crosshairRef))
 			s_crosshairKeyDoorFormId = crosshairRef->formID;
 		else if (crosshairRef)
 			s_crosshairKeyDoorFormId = 0;
 
 		// Load-door diagnostic: track cave mouths and any teleport door on crosshair.
-		if (crosshairRef && IsDoor(crosshairRef) && IsLoadDoor(crosshairRef)
-			&& !IsLoadDoorTransitionCooldownActive())
+		if (crosshairRef && IsDoor(crosshairRef) && IsLoadDoor(crosshairRef))
 			s_crosshairCaveDoorFormId = crosshairRef->formID;
 		else if (crosshairRef)
 			s_crosshairCaveDoorFormId = 0;
@@ -3943,11 +4031,9 @@ namespace InteractiveLockpickingVR
 		// Track the door under the crosshair for distance polling. VR fires
 		// per-hand; a null ref from one device must not clear a valid door
 		// target set by another (same rule as the activate-text tracker).
-		if (crosshairRef && IsDoor(crosshairRef) && !IsVanillaDoorOnly(crosshairRef)
-			&& !IsLoadDoorTransitionCooldownActive())
+		if (crosshairRef && IsDoor(crosshairRef) && !IsVanillaDoorOnly(crosshairRef))
 		{
 			s_crosshairDoorFormId = crosshairRef->formID;
-			SyncDoorAwaitingVanillaCloseState(crosshairRef);
 		}
 		else if (crosshairRef)
 			s_crosshairDoorFormId = 0;
@@ -3957,9 +4043,9 @@ namespace InteractiveLockpickingVR
 
 		if (s_sessionActive)
 		{
-			// The monitor task owns the session lifetime (distance / unlock
-			// checks). Crosshair only ends it early on a switch to a DIFFERENT
-			// locked door, so the pick can follow the player's new target.
+			// Lockpick sessions: monitor owns lifetime (distance / unlock).
+			// Hand-push: end when targeting a different door; raycast owns contact
+			// so walking outside DoorSessionEndDistance does not cancel.
 			if (crosshairRef && crosshairRef->baseForm && crosshairRef->baseForm->formType == kFormType_Door
 				&& crosshairRef->formID != s_targetDoorFormId)
 			{
@@ -3999,32 +4085,13 @@ namespace InteractiveLockpickingVR
 
 	namespace
 	{
-		constexpr UInt32 kDoorVanillaCloseRecordType = 'DRVC';
-		constexpr UInt32 kDoorVanillaCloseRecordVersion = 1;
-
-		void DoorVanillaCloseSaveCallback(SKSESerializationInterface* intfc)
+		void DoorMechanicsSaveCallback(SKSESerializationInterface* intfc)
 		{
-			if (!intfc || !intfc->OpenRecord(kDoorVanillaCloseRecordType, kDoorVanillaCloseRecordVersion))
-				return;
-
-			const UInt32 count = static_cast<UInt32>(s_interiorDoorsAwaitingVanillaClose.size());
-			intfc->WriteRecordData(&count, sizeof(count));
-
-			for (UInt32 formId : s_interiorDoorsAwaitingVanillaClose)
-				intfc->WriteRecordData(&formId, sizeof(formId));
-
-			if (count > 0)
-			{
-				LOG_INFO("Door lockpick: [save] persisted %u interior door(s) awaiting vanilla close",
-					count);
-			}
-
 			SaveLockpickSkillXp(intfc);
 		}
 
-		void DoorVanillaCloseLoadCallback(SKSESerializationInterface* intfc)
+		void DoorMechanicsLoadCallback(SKSESerializationInterface* intfc)
 		{
-			s_interiorDoorsAwaitingVanillaClose.clear();
 			RevertLockpickSkillXp();
 
 			if (!intfc)
@@ -4036,67 +4103,29 @@ namespace InteractiveLockpickingVR
 
 			while (intfc->GetNextRecordInfo(&type, &version, &length))
 			{
-				if (type == kDoorVanillaCloseRecordType && length >= sizeof(UInt32))
-				{
-					UInt32 count = 0;
-					if (intfc->ReadRecordData(&count, sizeof(count)) != sizeof(count))
-						continue;
-
-					const UInt32 maxCount = (length - sizeof(UInt32)) / sizeof(UInt32);
-					if (count > maxCount)
-						count = maxCount;
-
-					for (UInt32 i = 0; i < count; ++i)
-					{
-						UInt32 savedId = 0;
-						if (intfc->ReadRecordData(&savedId, sizeof(savedId)) != sizeof(savedId))
-							break;
-
-						UInt32 resolvedId = 0;
-						if (savedId != 0 && intfc->ResolveFormId(savedId, &resolvedId) && resolvedId != 0)
-							s_interiorDoorsAwaitingVanillaClose.insert(resolvedId);
-					}
-
-					LOG_INFO("Door lockpick: [load] recovered %u interior door(s) awaiting vanilla close",
-						static_cast<UInt32>(s_interiorDoorsAwaitingVanillaClose.size()));
-				}
-				else if (type == 'LKXP')
+				if (type == 'LKXP')
 				{
 					LoadLockpickSkillXpRecord(intfc, version, length);
 				}
+				else if (type == 'DRVC')
+				{
+					// Legacy interior vanilla-close co-save — discard.
+					UInt32 remaining = length;
+					while (remaining > 0)
+					{
+						UInt32 chunk = 0;
+						const UInt32 toRead = remaining >= sizeof(chunk) ? sizeof(chunk) : remaining;
+						if (intfc->ReadRecordData(&chunk, toRead) != toRead)
+							break;
+						remaining -= toRead;
+					}
+				}
 			}
 		}
 
-		void DoorVanillaCloseRevertCallback(SKSESerializationInterface* /*intfc*/)
+		void DoorMechanicsRevertCallback(SKSESerializationInterface* /*intfc*/)
 		{
-			s_interiorDoorsAwaitingVanillaClose.clear();
 			RevertLockpickSkillXp();
-		}
-
-		void PruneInvalidVanillaCloseDoors()
-		{
-			for (auto it = s_interiorDoorsAwaitingVanillaClose.begin();
-				it != s_interiorDoorsAwaitingVanillaClose.end();)
-			{
-				TESForm* form = LookupFormByID(*it);
-				TESObjectREFR* doorRef = form ? DYNAMIC_CAST(form, TESForm, TESObjectREFR) : nullptr;
-				if (!IsDoor(doorRef))
-				{
-					it = s_interiorDoorsAwaitingVanillaClose.erase(it);
-					continue;
-				}
-
-				// Saved awaiting state but the door loaded closed: restore push
-				// for this ref only (other refs in the set are unaffected).
-				if (IsDoorPhysicallyClosed(doorRef))
-				{
-					LOG_INFO("Door lockpick: [load] door %08X is closed, clearing stale awaiting state",
-						*it);
-					it = s_interiorDoorsAwaitingVanillaClose.erase(it);
-				}
-				else
-					++it;
-			}
 		}
 	}
 
@@ -4104,15 +4133,15 @@ namespace InteractiveLockpickingVR
 	{
 		if (!serialization)
 		{
-			LOG_INFO("Door lockpick: no SKSE serialization interface - interior door state will not persist across loads.");
+			LOG_INFO("Door lockpick: no SKSE serialization interface - lockpick XP will not persist across loads.");
 			return;
 		}
 
 		serialization->SetUniqueID(pluginHandle, 'BBVR');
-		serialization->SetRevertCallback(pluginHandle, DoorVanillaCloseRevertCallback);
-		serialization->SetSaveCallback(pluginHandle, DoorVanillaCloseSaveCallback);
-		serialization->SetLoadCallback(pluginHandle, DoorVanillaCloseLoadCallback);
-		LOG_INFO("Door lockpick: registered co-save serialization for interior door vanilla-close state.");
+		serialization->SetRevertCallback(pluginHandle, DoorMechanicsRevertCallback);
+		serialization->SetSaveCallback(pluginHandle, DoorMechanicsSaveCallback);
+		serialization->SetLoadCallback(pluginHandle, DoorMechanicsLoadCallback);
+		LOG_INFO("Door lockpick: registered co-save serialization for lockpick XP.");
 	}
 
 	void OnDoorMechanicsPreLoadGame()
@@ -4124,7 +4153,6 @@ namespace InteractiveLockpickingVR
 	{
 		StopLockpickSessionSound();
 		ClearLockpickSessionState();
-		PruneInvalidVanillaCloseDoors();
 		LOG_INFO("Door lockpick: session state cleared after save load");
 	}
 }

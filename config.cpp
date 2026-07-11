@@ -41,6 +41,11 @@ namespace InteractiveLockpickingVR {
     float unlockedDoorTouchDistance = 8.0f;
     int unlockedDoorPush = 1;
     int unlockedDoorSpawnDummy = 1;
+    int unlockedDoorPushHand = 0;
+    float unlockedDoorPushHapticStrength = 0.3f;
+    int unlockedDoorPushHapticLengthMs = 0;
+    int unlockedDoorUsePhysicsRaycast = 1;
+    float unlockedDoorHandRayLength = 12.0f;
     int keyDoorActions = 1;
 
 	// Helgen Keep entrance/exit (Skyrim.esm) - hinge origin is far from the
@@ -48,8 +53,6 @@ namespace InteractiveLockpickingVR {
 	std::vector<ExcludedDoorRef> excludedDoorRefs = {
 		{ "skyrim.esm", 0x0005DF01, 0 },  // Helgen Keep entrance
 		{ "skyrim.esm", 0x000F8237, 0 },  // Helgen Keep exit
-		{ "skyrim.esm", 0x0001C386, 0 },  // Solitude main gate entrance
-		{ "skyrim.esm", 0x00037F1B, 0 },  // Solitude main gate exit
 		{ "skyrim.esm", 0x00037603, 0 },  // Bleak Falls Barrow exit
 		{ "skyrim.esm", 0x0002B83B, 0 },  // Bleak Falls Barrow entrance
 		{ "skyrim.esm", 0x00025C00, 0 },
@@ -78,6 +81,7 @@ namespace InteractiveLockpickingVR {
 	// session-start radius than DoorSessionStartDistance.
 	std::vector<ExtendedSessionStartDoorBase> extendedSessionStartDoorBases = {
 		{ "skyrim.esm", 0x00060D85, 0 },
+		{ "skyrim.esm", 0x00097BE6, 0 },  // SDoorFrontGate (Solitude main gates, etc.)
 	};
 
 	std::vector<ShortSessionDoorRef> shortSessionDoorRefs = {};
@@ -683,6 +687,42 @@ namespace InteractiveLockpickingVR {
                         else if (variableName == "UnlockedDoorSpawnDummy")
                         {
                             unlockedDoorSpawnDummy = std::stoi(variableValueStr);
+                        }
+                        else if (variableName == "UnlockedDoorPushHand")
+                        {
+                            unlockedDoorPushHand = std::stoi(variableValueStr);
+                            if (unlockedDoorPushHand < 0)
+                                unlockedDoorPushHand = 0;
+                            else if (unlockedDoorPushHand > 2)
+                                unlockedDoorPushHand = 2;
+                        }
+                        else if (variableName == "UnlockedDoorPushHapticStrength")
+                        {
+                            unlockedDoorPushHapticStrength = std::stof(variableValueStr);
+                            if (unlockedDoorPushHapticStrength < 0.0f)
+                                unlockedDoorPushHapticStrength = 0.0f;
+                            else if (unlockedDoorPushHapticStrength > 1.0f)
+                                unlockedDoorPushHapticStrength = 1.0f;
+                        }
+                        else if (variableName == "UnlockedDoorPushHapticLengthMs")
+                        {
+                            unlockedDoorPushHapticLengthMs = std::stoi(variableValueStr);
+                            if (unlockedDoorPushHapticLengthMs < 0)
+                                unlockedDoorPushHapticLengthMs = 0;
+                            else if (unlockedDoorPushHapticLengthMs > 500)
+                                unlockedDoorPushHapticLengthMs = 500;
+                        }
+                        else if (variableName == "UnlockedDoorUsePhysicsRaycast")
+                        {
+                            unlockedDoorUsePhysicsRaycast = std::stoi(variableValueStr);
+                        }
+                        else if (variableName == "UnlockedDoorHandRayLength")
+                        {
+                            unlockedDoorHandRayLength = std::stof(variableValueStr);
+                            if (unlockedDoorHandRayLength < 1.0f)
+                                unlockedDoorHandRayLength = 1.0f;
+                            else if (unlockedDoorHandRayLength > 64.0f)
+                                unlockedDoorHandRayLength = 64.0f;
                         }
                         else if (variableName == "KeyDoorActions")
                         {

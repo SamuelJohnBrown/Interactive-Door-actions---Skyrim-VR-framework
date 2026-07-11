@@ -26,7 +26,7 @@ namespace InteractiveLockpickingVR
 	// True when WSActivateRollover should hide its prompt for this door ref.
 	bool IsDoorActivateTextSuppressed(TESObjectREFR* ref);
 
-	// SKSE co-save: persists interior doors opened via push that await vanilla close.
+	// SKSE co-save: lockpick skill XP persistence (and legacy record skip).
 	void RegisterDoorMechanicsSerialization(SKSESerializationInterface* serialization, PluginHandle pluginHandle);
 	void OnDoorMechanicsPreLoadGame();
 	void OnDoorMechanicsPostLoadGame();
