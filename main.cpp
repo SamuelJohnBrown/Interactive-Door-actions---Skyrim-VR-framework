@@ -93,13 +93,13 @@ namespace InteractiveLockpickingVR
 			{
 				if (msg->type == SKSEMessagingInterface::kMessage_PostLoad)
 				{
-
 				}
 				else if (msg->type == SKSEMessagingInterface::kMessage_InputLoaded)
 					SetupReceptors();
 				else if (msg->type == SKSEMessagingInterface::kMessage_DataLoaded)
 				{
 					InteractiveLockpickingVR::loadConfig();
+					InteractiveLockpickingVR::DetectLegacyInteractiveLockpickingMod();
 
 					// NEW SKSEVR feature: trampoline interface object from QueryInterface() - Use SKSE existing process code memory pool - allow Skyrim to run without ASLR
 					if (InteractiveLockpickingVR::g_trampolineInterface)

@@ -31,6 +31,14 @@ namespace InteractiveLockpickingVR {
 	extern int removeActivateText;
 	extern int doorLockpick;
 	extern int excludeLockedDoors;
+
+	// True when InteractiveLockpickingVR.dll is loaded; lockpick sessions stay off
+	// while unlocked push and key-door actions remain available.
+	extern bool legacyInteractiveLockpickingPresent;
+
+	void DetectLegacyInteractiveLockpickingMod();
+	bool AreLockpickSessionsEnabled();
+
 	extern int lockTierNoviceHoldMs;
 	extern int lockTierApprenticeHoldMs;
 	extern int lockTierAdeptHoldMs;
@@ -60,7 +68,6 @@ namespace InteractiveLockpickingVR {
 	extern float unlockedDoorPushDistance;
 	extern float unlockedDoorTouchDistance;
 	extern int unlockedDoorPush;
-	extern int unlockedDoorSpawnDummy;
 	extern int unlockedDoorPushHand;
 	extern float unlockedDoorPushHapticStrength;
 	extern int unlockedDoorPushHapticLengthMs;
@@ -80,7 +87,7 @@ namespace InteractiveLockpickingVR {
 
 	bool IsExcludedDoorRef(TESObjectREFR* ref);
 
-	// Base DOOR forms (not refs) excluded from interior non-load push/dummy
+	// Base DOOR forms (not refs) excluded from interior non-load push
 	// logic. All other interior non-load doors use physical interaction.
 	struct ExcludedInteriorDoorBase
 	{

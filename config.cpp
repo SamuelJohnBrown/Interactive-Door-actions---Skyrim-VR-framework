@@ -1,8 +1,12 @@
 #include "config.h"
 #include "SkyrimVRESLAPI.h"
 
+#include <Windows.h>
+#include <Psapi.h>
 #include <algorithm>
 #include <sstream>
+
+#pragma comment(lib, "Psapi.lib")
 
 namespace InteractiveLockpickingVR {
 		
@@ -11,6 +15,7 @@ namespace InteractiveLockpickingVR {
     int removeActivateText = 1;
     int doorLockpick = 1;
     int excludeLockedDoors = 0;
+	bool legacyInteractiveLockpickingPresent = false;
     int lockTierNoviceHoldMs = 3000;
     int lockTierApprenticeHoldMs = 4000;
     int lockTierAdeptHoldMs = 5000;
@@ -40,7 +45,6 @@ namespace InteractiveLockpickingVR {
     float unlockedDoorPushDistance = 4.0f;
     float unlockedDoorTouchDistance = 8.0f;
     int unlockedDoorPush = 1;
-    int unlockedDoorSpawnDummy = 1;
     int unlockedDoorPushHand = 0;
     float unlockedDoorPushHapticStrength = 0.3f;
     int unlockedDoorPushHapticLengthMs = 0;
@@ -684,10 +688,6 @@ namespace InteractiveLockpickingVR {
                         {
                             unlockedDoorTouchDistance = std::stof(variableValueStr);
                         }
-                        else if (variableName == "UnlockedDoorSpawnDummy")
-                        {
-                            unlockedDoorSpawnDummy = std::stoi(variableValueStr);
-                        }
                         else if (variableName == "UnlockedDoorPushHand")
                         {
                             unlockedDoorPushHand = std::stoi(variableValueStr);
@@ -781,6 +781,65 @@ namespace InteractiveLockpickingVR {
         }
         return;
     }
+
+	void DetectLegacyInteractiveLockpickingMod()
+	{
+		// Exact name first; then scan loaded modules in case of path/casing quirks.
+		HMODULE module = GetModuleHandleA("InteractiveLockpickingVR.dll");
+		if (!module)
+		{
+			HMODULE modules[1024] = {};
+			DWORD bytesNeeded = 0;
+			HANDLE process = GetCurrentProcess();
+			if (EnumProcessModules(process, modules, sizeof(modules), &bytesNeeded))
+			{
+				const unsigned count = bytesNeeded / sizeof(HMODULE);
+				for (unsigned i = 0; i < count; ++i)
+				{
+					char path[MAX_PATH] = {};
+					if (GetModuleFileNameA(modules[i], path, MAX_PATH) == 0)
+						continue;
+
+					const char* fileName = path;
+					for (const char* p = path; *p; ++p)
+					{
+						if (*p == '\\' || *p == '/')
+							fileName = p + 1;
+					}
+
+					if (_stricmp(fileName, "InteractiveLockpickingVR.dll") == 0)
+					{
+						module = modules[i];
+						break;
+					}
+				}
+			}
+		}
+
+		legacyInteractiveLockpickingPresent = (module != nullptr);
+
+		if (legacyInteractiveLockpickingPresent)
+		{
+			_MESSAGE("[Compat] InteractiveLockpickingVR.dll: FOUND — physical lockpick sessions OFF (unlocked door push + key unlocks stay ON)");
+		}
+		else
+		{
+			_MESSAGE("[Compat] InteractiveLockpickingVR.dll: not found — physical lockpick sessions follow INI (DoorLockpick / ExcludeLockedDoors)");
+		}
+
+		_MESSAGE("[Compat] Physical lockpick sessions enabled=%d (DoorLockpick=%d ExcludeLockedDoors=%d legacyDll=%d)",
+			AreLockpickSessionsEnabled() ? 1 : 0,
+			doorLockpick,
+			excludeLockedDoors,
+			legacyInteractiveLockpickingPresent ? 1 : 0);
+	}
+
+	bool AreLockpickSessionsEnabled()
+	{
+		return doorLockpick != 0
+			&& excludeLockedDoors == 0
+			&& !legacyInteractiveLockpickingPresent;
+	}
 
 	void Log(const int msgLogLevel, const char* fmt, ...)
 	{

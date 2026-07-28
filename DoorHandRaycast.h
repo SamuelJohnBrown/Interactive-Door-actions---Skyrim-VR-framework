@@ -5,7 +5,7 @@
 
 namespace InteractiveLockpickingVR
 {
-	// Havok physics raycast for hand-on-door contact.
+	// Havok physics raycast for hand/tool-on-door contact.
 	// Must run on the main game thread.
 
 	struct DoorHandRaycastHit
