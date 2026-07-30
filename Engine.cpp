@@ -138,9 +138,11 @@ namespace InteractiveLockpickingVR
 
 	// Called from main.cpp once SKSE messaging is available, so we can sink
 	// SKSE's crosshair ref event and know what the player is pointing at.
+	// Always register: door push / lockpick sessions need crosshair tracking.
+	// RemoveActivateText only controls whether the rollover menu is hooked.
 	void RegisterActivateTextSinks(SKSEMessagingInterface* messaging)
 	{
-		if (removeActivateText == 0 || !messaging)
+		if (!messaging)
 			return;
 
 		auto* crosshairDispatcher = static_cast<EventDispatcher<SKSECrosshairRefEvent>*>(

@@ -1819,13 +1819,19 @@ namespace InteractiveLockpickingVR
 			virtual void Run() override
 			{
 				TESObjectREFR* ref = LookupLiveRefByFormId(m_formId);
-				if (!ref)
-					return;
+				if (ref)
+				{
+					if (higgsInterface && higgsInterface->GetGrabbedObject(m_isLeftVR) == ref)
+						higgsInterface->DisableHand(m_isLeftVR);
 
-				if (higgsInterface && higgsInterface->GetGrabbedObject(m_isLeftVR) == ref)
-					higgsInterface->DisableHand(m_isLeftVR);
+					DeleteWorldObject(ref);
+				}
 
-				DeleteWorldObject(ref);
+				// Always re-enable: DisableHand above (or an earlier release) can
+				// leave this controller unable to grab. Matches inventory-return
+				// teardown; without this the off-hand (shiv) stays dead after unlock.
+				if (higgsInterface)
+					higgsInterface->EnableHand(m_isLeftVR);
 			}
 
 			virtual void Dispose() override
